@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Multer for file uploads (optional)
+// Multer: separate header + attachments
 const upload = multer({ dest: 'uploads/' });
 
 // Nodemailer transporter
@@ -43,92 +43,96 @@ async function sendAllWithLimit(items, workerFn, limit = 5) {
 }
 
 // POST /send
-app.post('/send', upload.single('file'), async (req, res) => {
-  try {
-    const {
-      fromName,
-      fromEmail,
-      subject,
-      recipients,
-      concurrency,
-      imageType,
-      imagePath: imageURL,
-      body
-    } = req.body;
+app.post(
+  '/send',
+  upload.fields([{ name: 'header', maxCount: 1 }, { name: 'files', maxCount: 5 }]),
+  async (req, res) => {
+    try {
+      const {
+        fromName,
+        fromEmail,
+        subject,
+        recipients,
+        concurrency,
+        imageType,   // "url" if you want an external image
+        imagePath,   // URL of external image
+        body
+      } = req.body;
 
-    const file = req.file; // Optional uploaded file
+      const headerFile = req.files['header'] ? req.files['header'][0] : null;
+      const attachmentFiles = req.files['files'] || [];
 
-    if (!fromEmail || !subject || !recipients || !body) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    const recipientList = JSON.parse(recipients);
-
-    // Prepare image source
-    let imageSrc = '';
-    if (imageType === 'local') {
-      if (file) imageSrc = 'cid:headerImage';
-      else imageSrc = '';
-    } else if (imageType === 'url') {
-      imageSrc = imageURL || '';
-    } else {
-      return res.status(400).json({ error: 'Invalid imageType' });
-    }
-
-    const worker = async (recipient) => {
-      const replacedSubject = subject.replace(/\{\{name\}\}/g, recipient.name || '');
-      const replacedBody = body.replace(/\{\{name\}\}/g, recipient.name || '');
-
-      const attachments = [];
-
-      // Attach header image if local
-      if (file && imageType === 'local') {
-        attachments.push({
-          filename: file.originalname,
-          path: file.path,
-          cid: 'headerImage'
-        });
+      if (!fromEmail || !subject || !recipients || !body) {
+        return res.status(400).json({ error: 'Missing required fields' });
       }
 
-      // Optional: Attach any additional file if provided (user can send any file)
-      // You can allow users to send multiple files if needed by using upload.array('files') in multer
-      if (file && imageType !== 'local') {
-        attachments.push({
-          filename: file.originalname,
-          path: file.path
-        });
+      const recipientList = JSON.parse(recipients);
+
+      // Image source
+      let imageSrc = '';
+      if (headerFile) {
+        // Uploaded header image
+        imageSrc = 'cid:headerImage';
+      } else if (imageType === 'url' && imagePath) {
+        // External image
+        imageSrc = imagePath;
       }
 
-      const mailOptions = {
-        from: `${fromName || ''} <${fromEmail}>`,
-        to: recipient.email,
-        subject: replacedSubject,
-        html: `
-          <div style="text-align:center;">
-            ${imageSrc ? `<img src="${imageSrc}" style="max-width:1500px;width:100%;height:auto;"/>` : ''}
-            <div style="margin-top:20px; text-align:left; font-family: Arial, sans-serif; font-size:14px;">
-              ${replacedBody.replace(/\n/g, '<br/>')}
+      const worker = async (recipient) => {
+        const replacedSubject = subject.replace(/\{\{name\}\}/g, recipient.name || '');
+        const replacedBody = body.replace(/\{\{name\}\}/g, recipient.name || '');
+
+        const attachments = [];
+
+        // Header image from upload
+        if (headerFile) {
+          attachments.push({
+            filename: headerFile.originalname,
+            path: headerFile.path,
+            cid: 'headerImage'
+          });
+        }
+
+        // Additional files
+        for (const f of attachmentFiles) {
+          attachments.push({
+            filename: f.originalname,
+            path: f.path
+          });
+        }
+
+        const mailOptions = {
+          from: `${fromName || ''} <${fromEmail}>`,
+          to: recipient.email,
+          subject: replacedSubject,
+          html: `
+            <div style="text-align:center;">
+              ${imageSrc ? `<img src="${imageSrc}" style="max-width:1500px;width:100%;height:auto;"/>` : ''}
+              <div style="margin-top:20px; text-align:left; font-family: Arial, sans-serif; font-size:14px;">
+                ${replacedBody.replace(/\n/g, '<br/>')}
+              </div>
             </div>
-          </div>
-        `,
-        attachments
+          `,
+          attachments
+        };
+
+        const info = await transporter.sendMail(mailOptions);
+        return { ok: true, info };
       };
 
-      const info = await transporter.sendMail(mailOptions);
-      return { ok: true, info };
-    };
+      const results = await sendAllWithLimit(recipientList, worker, Math.max(1, Number(concurrency)));
 
-    const results = await sendAllWithLimit(recipientList, worker, Math.max(1, Number(concurrency)));
+      // Cleanup
+      if (headerFile) fs.unlinkSync(headerFile.path);
+      for (const f of attachmentFiles) fs.unlinkSync(f.path);
 
-    // Delete uploaded file after sending
-    if (file) fs.unlinkSync(file.path);
-
-    res.json({ ok: true, results });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: err.message });
+      res.json({ ok: true, results });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
   }
-});
+);
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Mail server running on port ${PORT}`));
